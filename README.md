@@ -89,6 +89,46 @@ traj, vis = model(video, queries)
 # vis:  (1, T, N)     -> per-point visibility in {0, 1}
 ```
 
+### Frame-by-frame usage
+
+In addition to full-video inference, `Predictor` supports **frame-by-frame tracking** via `forward_frame`.  
+New queries can be introduced at arbitrary timesteps, and full-video inference internally relies on the same mechanism.  
+This interface is intended for streaming scenarios where frames are processed sequentially.  
+For a complete reference implementation of video-level tracking, please check `Predictor.forward`, which shows how frame-by-frame tracking is composed into a full pipeline.
+
+```python
+import torch
+from model.trackon_predictor import Predictor
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Initialize
+model = Predictor(args, checkpoint_path="path/to/checkpoint.pth").to(device).eval()
+model.reset()  # reset internal memory before a new video
+
+# video:   (1, T, 3, H, W)
+# queries: (1, N, 3) with rows = (t, x, y)
+video = ...
+queries = ...
+
+for t in range(video.shape[1]):
+    frame = video[:, t]  # (1, 3, H, W)
+
+    # Add queries whose start time is t
+    new_queries = (
+        queries[0, queries[0, :, 0] == t, 1:]
+        if queries is not None else None
+    )
+
+    # Track a single frame
+    points_t, vis_t = model.forward_frame(
+        frame,
+        new_queries=new_queries
+    )
+
+    # points_t: (N_active, 2), vis_t: (N_active,)
+```
+
 ### Using `demo.py`
 
 A ready-to-run script ([`demo.py`](demo.py)) handles loading, preprocessing, inference, and visualization.

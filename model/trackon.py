@@ -421,22 +421,15 @@ class Track_On2(nn.Module):
 
         return out
 
-
-
-    def forward_frame(self, q_init, temporal_mask, point_memory, frame):
-        # :args q_init: (N, D)
-        # :args temporal_mask: (N, M) True if masked
-        # :args point_memory: (N, M, D)
-        # :args frame: (1, 3, H_in, W_in) in range [0, 255]
-
-        B, N, D = q_init.shape
-        M = point_memory.shape[2]
-        device = frame.device
-
-        q_t = q_init.unsqueeze(0).clone()                  # (1, N, D)
-        memory_mask_t = temporal_mask.clone()              # (N, M)
-        memory = point_memory.clone()                      # (N, M, D)
-
+    # ==== Functions for Streaming inference below ==== #
+    @torch.no_grad()
+    def extract_frame_features(self, frame):
+        """
+        Extract multi-scale features from a single frame.
+        
+        :args frame: Tensor of shape (1, 3, H_in, W_in) in range [0, 255]
+        :return: Tuple of (f4_t, f8_t, f16_t, f32_t, f_fused_t) where all are (1, P_x, D)
+        """
         # === Scaling ====
         frame = frame / 255.0                               # to [0, 1]
         frame = F.interpolate(frame, 
@@ -445,18 +438,52 @@ class Track_On2(nn.Module):
                               align_corners=False)          # (1, 3, H, W)
         frame = frame.unsqueeze(1)                          # (1, 1, 3, H, W)
         # === === ===
-
+        
         # === Visual Backbone Feedforward ===
         f4_t, f8_t, f16_t, f32_t = self.backbone(frame)     # (1, 1, P, D), (1, 1, P // 4, D), (1, 1, P // 16, D), (1, 1, P // 64, D)
         f_fused_t = self.fpn(f4_t, f8_t, f16_t, f32_t)      # (1, 1, P, D)
-        f4_t = f4_t.squeeze(0)                                                              # (1, P, D)
-        f8_t = f8_t.squeeze(0)                                                              # (1, P // 4, D)
-        f16_t = f16_t.squeeze(0)                                                            # (1, P // 16, D)
-        f32_t = f32_t.squeeze(0)                                                            # (1, P // 64, D)
-        f_fused_t = f_fused_t.squeeze(0)                                                    # (1, P, D)
+        
+        # Squeeze out batch dimension
+        f4_t = f4_t.squeeze(0)                              # (1, P, D)
+        f8_t = f8_t.squeeze(0)                              # (1, P // 4, D)
+        f16_t = f16_t.squeeze(0)                            # (1, P // 16, D)
+        f32_t = f32_t.squeeze(0)                            # (1, P // 64, D)
+        f_fused_t = f_fused_t.squeeze(0)                    # (1, P, D)
         # === === ===
+        
+        return f4_t, f8_t, f16_t, f32_t, f_fused_t
+
+    @torch.no_grad()
+    def track_frame(self, q_init, temporal_mask, point_memory, frame_features, H_in, W_in):
+        """
+        Track queries through one frame using pre-extracted features.
+        
+        :args q_init: (N, D) - Query features
+        :args temporal_mask: (N, M) - Temporal mask (True if masked)
+        :args point_memory: (N, M, D) - Point memory
+        :args frame_features: Tuple of (f4_t, f8_t, f16_t, f32_t, f_fused_t)
+        :args H_in: Original frame height
+        :args W_in: Original frame width
+        :return: (p, v_logit, q_new) where p is (N, 2), v_logit is (N,), q_new is (N, D)
+        """
+        N, D = q_init.shape
+        M = point_memory.shape[1]
+        
+        f4_t, f8_t, f16_t, f32_t, f_fused_t = frame_features
+        device = f4_t.device
+
+        q_t = q_init.unsqueeze(0).clone()                  # (1, N, D)
+        memory_mask_t = temporal_mask.clone()              # (N, M)
+        memory = point_memory.clone()                      # (N, M, D)
 
         # === Query Decoder ===
+        # Pre-allocate buffers for efficiency
+        qkv = torch.zeros(N, M + 1, D, device=device, dtype=memory.dtype)
+        qkv[:, :-1] = memory  # Fill memory part once
+        mask = torch.zeros(N, M + 1, device=device, dtype=torch.bool)
+        mask[:, :-1] = memory_mask_t
+        mask[:, -1] = False  # Query position is never masked
+        
         for i in range(self.decoder_layer_num):
             # === Attention to frame features ===
             q_t = self.feature_attention[i](q_t, 
@@ -469,16 +496,15 @@ class Track_On2(nn.Module):
             # === === ===
 
             # === Attention to memory ===
-            q_t = q_t.view(N, 1, D)                             # (N, 1, D)
+            q_t_view = q_t.view(N, D)                           # (N, D)
 
-            qkv = torch.cat([memory, q_t], dim=1)                                                    # (N, M + 1, D)
-            mask = torch.cat([memory_mask_t, torch.zeros(N, 1, device=device).bool()], dim=1)        # (N, M + 1)
+            qkv[:, -1] = q_t_view  # Update only the query position
             qkv = self.memory_attention[i](qkv + self.t_embedding,
                                             qkv + self.t_embedding,
                                             qkv,
                                             mask)                           # (N, M + 1, D)
             q_t = qkv[:, -1].unsqueeze(0)                                   # (1, N, D)
-            memory = qkv[:, :-1]                                            # (N, M, D)
+            qkv[:, :-1] = qkv[:, :-1].clone()  # Preserve memory for next iteration
             # === === ===
 
         q_t = self.projection1(q_t)
@@ -490,7 +516,7 @@ class Track_On2(nn.Module):
         q_t = self.projection2(q_t)                                                            # (1, N, D)
 
         c2 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t)                                        # (1, N, P)
-        p_patch = indices_to_coords(torch.argmax(c2.detach(), dim=-1).unsqueeze(1), self.input_size, self.stride)   # (1, 1, N, 2), in range [H, W]
+        p_patch = indices_to_coords(torch.argmax(c2, dim=-1).unsqueeze(1), self.input_size, self.stride)   # (1, 1, N, 2), in range [H, W]
         p_patch = p_patch.squeeze(1)                                                                               # (1, N, 2)
         # === === ===
 
@@ -498,7 +524,12 @@ class Track_On2(nn.Module):
         o, v_logit, u_logit = self.prediction_head(q_t, f4_t, f8_t, f16_t, f32_t, p_patch)        # (layer_num, N, 2), (N), (N)
         # === === ===
 
-        p = p_patch[0] + o[-1]                   # (1, N, 2)
-        p = p[0]
+        # === Final predictions (point_mechanism='a') ===
+        p = p_patch[0] + o[-1]                   # (N, 2)
+        
+        # Scale back to original image coordinates
+        p[..., 0] = (p[..., 0] / self.W) * W_in
+        p[..., 1] = (p[..., 1] / self.H) * H_in
+        # === === ===
 
-        return p, v_logit, q_t.detach()
+        return p, v_logit, q_t.squeeze(0)  # (N, 2), (N), (N, D)

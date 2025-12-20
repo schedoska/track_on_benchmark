@@ -23,16 +23,16 @@ from torchvision.io import read_video
 from model.trackon_predictor import Predictor
 from utils.train_utils import load_args_from_yaml
 from utils.vis_utils import plot_tracks_wo_tail, save_video
-
+from evaluation.evaluator import get_points_on_a_grid 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Track-On2 demo")
     p.add_argument("--video", required=True, type=str, help="Path to input video (e.g., .mp4)")
     p.add_argument("--config", default="./config/test.yaml", type=str, help="Path to model config .yaml")
     p.add_argument("--ckpt", required=True, type=str, help="Path to Track-On2 checkpoint .pth")
-    p.add_argument("--output", default="demp_output.mp4", type=str, help="Path to output visualization video")
+    p.add_argument("--output", default="demo_output.mp4", type=str, help="Path to output visualization video")
     p.add_argument("--use-grid", default=False, type=lambda x: str(x).lower() in {"1","true","yes","y"},
-                   help="If true, uses a uniform grid of queries (set queries=None).")
+                   help="If true, uses a uniform grid of queries.")
     p.add_argument("--point-size", default=100, type=int, help="Dot size for visualization.")
     return p.parse_args()
 
@@ -83,6 +83,15 @@ def build_manual_queries(device: str) -> torch.Tensor:
     ).unsqueeze(0)  # (1, N, 3)
     return q
 
+def build_uniform_grid_queries(device: str, grid_size: int, H: int, W: int) -> torch.Tensor:
+    """
+    Build uniform grid queries in (1, N, 3) with (t, x, y).
+    """
+    extra = get_points_on_a_grid(grid_size, (H, W), device)  # (1, S^2, 2)
+    extra = extra.squeeze(0)  # (S^2, 2)
+    extra_queries = torch.cat([torch.zeros(extra.shape[0], 1, device=device), extra], dim=1)  # (S^2, 3)
+    return extra_queries.unsqueeze(0)  # (1, S^2, 3)
+
 
 def main() -> None:
     args = parse_args()
@@ -104,14 +113,21 @@ def main() -> None:
     model_args = load_args_from_yaml(args.config)
 
     print(f"[Info] Initializing model with checkpoint: {args.ckpt}")
-    model = Predictor(model_args, checkpoint_path=args.ckpt).to(device).eval()
+    model = Predictor(model_args, checkpoint_path=args.ckpt, support_grid_size=0).to(device).eval()
 
     # === Initialize the Queries ===
     if args.use_grid:
-        queries: Optional[torch.Tensor] = None  # uniform grid via model's default
+        queries = build_uniform_grid_queries(
+            device,
+            grid_size=20,
+            H=video_tchw.shape[2],
+            W=video_tchw.shape[3],
+        )
         print("[Info] Using uniform grid queries (queries=None).")
+        
     else:
         queries = build_manual_queries(device)
+        model.support_grid_size = 20
         print(f"[Info] Using manual queries with shape: {tuple(queries.shape)}")
 
     # === Run the model ===
