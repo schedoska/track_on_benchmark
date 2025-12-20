@@ -119,12 +119,12 @@ def main() -> None:
     if args.use_grid:
         queries = build_uniform_grid_queries(
             device,
-            grid_size=20,
+            grid_size=32,
             H=video_tchw.shape[2],
             W=video_tchw.shape[3],
         )
         print("[Info] Using uniform grid queries (queries=None).")
-        
+
     else:
         queries = build_manual_queries(device)
         model.support_grid_size = 20
