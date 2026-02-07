@@ -33,7 +33,7 @@ video = torch.from_numpy(np.stack(frames_small)) \
 model.eval()
 
 for t in range(video.shape[1]):
-    if t % 2 == 0:
+    if t % 3 == 0:
         continue
     #frame = video[:, t]  # (1, 3, H, W)
     vid_batch = video[0,t].unsqueeze(0).to(device)
