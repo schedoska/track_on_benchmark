@@ -1,0 +1,2 @@
+conda create -n torch_cuda python=3.10 -y       #### python 3.10 mus byc z jakiegos powodu
+pip install torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1+cu121   --index-url https://download.pytorch.org/whl/cu121
